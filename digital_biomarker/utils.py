@@ -598,7 +598,7 @@ def summarize_output(filepath, subject_list):
         test_true = output['test_true']
         #########################################################################
         # test_scores = output['test_scores']
-        test_scores = np.load(f'./input/predictions2_wnd_sz_3_overlap_1_3/{s:02d}.npz',
+        test_scores = np.load(f"./input/{os.environ.get('PRED_PREFIX', 'predictions2')}_wnd_sz_3_overlap_1_3/{s:02d}.npz",
                               allow_pickle=True)['out']
         #########################################################################
         test_pred = np.argmax(test_scores, axis=1)

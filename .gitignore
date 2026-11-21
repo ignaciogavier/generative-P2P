@@ -1,1 +1,21 @@
-./digital_biomarker/*
+# Data, models and outputs are never part of this repository
+data/
+models/
+synthetic_dataset/
+trajectories/
+results/
+wandb/
+strokerehab_data/
+generative_pipeline/feature_extraction/
+digital_biomarker/input/
+digital_biomarker/output/
+*.pth
+*.npz
+
+# Python / OS / editors
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/

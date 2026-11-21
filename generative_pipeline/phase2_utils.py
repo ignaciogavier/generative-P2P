@@ -6,16 +6,24 @@ import glob
 import os
 
 
-def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True):
+# Phase II: retargets a Phase I trajectory onto the avatar (MoCap pose P01G01R03F0792T0844A0402.npy) and returns the
+# wrist trajectory used to synthesize IMU data (phase2_simulate_movement.py).
+# Drift keyframes before/after the movement: each step has a random sign per axis and the drift is clipped to
+# r_clip = max(0.5 m, |movement endpoint|) (revision fix; the submitted version projected every offset < 0.5 m onto
+# a 0.5 m sphere and always drifted towards +x, +y, +z).
+# fixed_scale=True (ablation C, fixed sensor placement) uses the mean avatar scale 1.3 instead of N(1.3, 0.1^2).
+AVATAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'P01G01R03F0792T0844A0402.npy')
+
+
+def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True, fixed_scale=False):
     WSZ = FS * WLEN
 
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete()
 
     # Assume mocap_data is an array of shape (T, 24, 3)
-    mocap_data = np.load('/home/igavier_umass_edu/Documents/synthetic-pipeline/P01G01R03F0792T0844A0402.npy')
-    #mocap_data = np.load('/Users/igavier/Desktop/blender_output/31.npy')
-    mocap_data *= np.random.randn() * 0.1 + 1.3
+    mocap_data = np.load(AVATAR)
+    mocap_data *= 1.3 if fixed_scale else (np.random.randn() * 0.1 + 1.3)
     mocap_data -= mocap_data[:,0:1]
 
     # Create a new armature
@@ -265,12 +273,14 @@ def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True):
     keyframes_pre = np.random.randint(1, keyframe_initial, size=keyframe_initial//20)
     keyframes_pre = np.sort(np.unique(keyframes_pre))[::-1]
     offset_curr = offsets[0]
+    r_clip = max(0.5, float(np.linalg.norm(offset_curr)))
     kf_curr = keyframe_initial
     for kfp in keyframes_pre:
         dur = 1. / FS * (kf_curr - kfp)
         offset_delta = dur ** (0.33) * 10 ** (- 3 + .6 * np.random.randn(3))
+        offset_delta *= np.random.choice([-1., 1.], size=3)
         offset_curr += offset_delta
-        offset_curr *= 0.5 / min(0.5, np.linalg.norm(offset_curr))
+        offset_curr *= min(1., r_clip / np.linalg.norm(offset_curr))
         target.location = bones[f'{hand}arm3'].matrix.translation + Vector(offset_curr)
         target.keyframe_insert("location", frame=kfp)
         kf_curr = kfp
@@ -278,12 +288,14 @@ def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True):
     keyframes_pos = np.random.randint(keyframe_final + 1, WSZ + 1, size=(WSZ - keyframe_final)//20)
     keyframes_pos = np.sort(np.unique(keyframes_pos))
     offset_curr = offsets[-1]
+    r_clip = max(0.5, float(np.linalg.norm(offset_curr)))
     kf_curr = keyframe_final
     for kfp in keyframes_pos:
         dur = 1. / FS * (kfp - kf_curr)
         offset_delta = dur ** (0.33) * 10 ** (- 3 + .6 * np.random.randn(3))
+        offset_delta *= np.random.choice([-1., 1.], size=3)
         offset_curr += offset_delta
-        offset_curr *= 0.5 / min(0.5, np.linalg.norm(offset_curr))
+        offset_curr *= min(1., r_clip / np.linalg.norm(offset_curr))
         target.location = bones[f'{hand}arm3'].matrix.translation + Vector(offset_curr)
         target.keyframe_insert("location", frame=kfp)
         kf_curr = kfp
@@ -327,12 +339,14 @@ def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True):
     keyframes_pre = np.random.randint(1, keyframe_initial, size=keyframe_initial//20)
     keyframes_pre = np.sort(np.unique(keyframes_pre))[::-1]
     offset_curr = offsets[0]
+    r_clip = max(0.5, float(np.linalg.norm(offset_curr)))
     kf_curr = keyframe_initial
     for kfp in keyframes_pre:
         dur = 1. / FS * (kf_curr - kfp)
         offset_delta = dur ** (0.33) * 10 ** (- 3 + .6 * np.random.randn(3))
+        offset_delta *= np.random.choice([-1., 1.], size=3)
         offset_curr += offset_delta
-        offset_curr *= 0.5 / min(0.5, np.linalg.norm(offset_curr))
+        offset_curr *= min(1., r_clip / np.linalg.norm(offset_curr))
         target_idle.location = bones[f'{hand_idle}arm3'].matrix.translation + Vector(offset_curr)
         target_idle.keyframe_insert("location", frame=kfp)
         kf_curr = kfp
@@ -340,12 +354,14 @@ def blender(synth_trajectory, FS=60, WLEN=3, pos_rot=True):
     keyframes_pos = np.random.randint(keyframe_final + 1, WSZ + 1, size=(WSZ - keyframe_final)//20)
     keyframes_pos = np.sort(np.unique(keyframes_pos))
     offset_curr = offsets[-1]
+    r_clip = max(0.5, float(np.linalg.norm(offset_curr)))
     kf_curr = keyframe_final
     for kfp in keyframes_pos:
         dur = 1. / FS * (kfp - kf_curr)
         offset_delta = dur ** (0.33) * 10 ** (- 3 + .6 * np.random.randn(3))
+        offset_delta *= np.random.choice([-1., 1.], size=3)
         offset_curr += offset_delta
-        offset_curr *= 0.5 / min(0.5, np.linalg.norm(offset_curr))
+        offset_curr *= min(1., r_clip / np.linalg.norm(offset_curr))
         target_idle.location = bones[f'{hand_idle}arm3'].matrix.translation + Vector(offset_curr)
         target_idle.keyframe_insert("location", frame=kfp)
         kf_curr = kfp

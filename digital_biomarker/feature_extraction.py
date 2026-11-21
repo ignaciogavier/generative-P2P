@@ -1,3 +1,17 @@
+"""Digital biomarkers: segment movements in the stroke recordings and extract movement-element features (Fig. 5).
+
+Run from digital_biomarker/. Inputs: input/stroke_annotationUPDATE.npz, input/stroke_subject_info.xlsx,
+input/wnd_sz_3_overlap_1_3/ (windows), input/<META_PREFIX>_wnd_sz_3_overlap_1_3/ (window labels and masks; META_PREFIX=predictions) and the
+detector scores input/<PRED_PREFIX>_wnd_sz_3_overlap_1_3/<ss>.npz (predict.py); orientation-estimated recordings
+<STROKE_KINEMATICS>/stroke_data_<ahrs>.npz (default STROKE_KINEMATICS=input).
+Segmentation: 'p2p_true' (manual labels) and 'p2p_pred' (detector), SEG_METHODS="p2p_true p2p_pred".
+Every padding delta in 0, 0.1, ..., 1 s is saved under the key (ahrs, seg_method, delta): the delta is chosen later, inside
+the LOSO, by motor_assessment.py (choosing it here from the correlation with the clinical scores of all subjects would
+leak the test subjects' outcomes).
+Output: output/<rfunc>_<corr_target>/feature_dict_alldelta_<timestamp>_<ahrs>_ICC_<type>_<thr>_<wnd>_split_method_1_1.5.npz
+Example: META_PREFIX=predictions PRED_PREFIX=predictions_local_H0p35_seed1 python feature_extraction.py --ahrs_filter_type mahony --rfunc spearmanr \
+             --timestamp local_H0p35_seed1 --corr_target FM --input_wnd_data wnd_sz_3_overlap_1_3
+"""
 #################################
 # extract features using
 # each movement
@@ -18,23 +32,9 @@ import scripts.kinematic_approach as kinematic_approach
 import scripts.features as mvmt_elem_features
 # from preprocess import window
 
-work_dir = os.path.join(
-    '/work',
-    'pi_sunghoonlee_umass_edu',
-    'Yunda'
-)
+# input_dir has the stroke recordings with estimated orientations (stroke_data_<ahrs>.npz)
+input_dir = os.environ.get('STROKE_KINEMATICS', 'input')
 
-# input_dir has stroke data 
-# with generated orientations
-input_dir = os.path.join(
-    work_dir,
-    'kinematic_measures'
-)
-
-# output_dir = os.path.join(
-#     work_dir,
-#     'kinematic_measures'
-# )
 output_dir = 'output'
 
 
@@ -99,7 +99,7 @@ def main():
         args.input_wnd_data))
     
     # load predictions
-    filepath = os.path.join('input', 'predictions2_{:s}'.format(args.input_wnd_data))
+    filepath = os.path.join('input', os.environ.get('META_PREFIX', 'predictions2') + '_{:s}'.format(args.input_wnd_data))  # window labels and masks; detector scores come from PRED_PREFIX (utils.summarize_output)
     nn_results = summarize_output(filepath, subject_list)
     
     #####################################################
@@ -119,7 +119,7 @@ def main():
     #####################################################
     
     kwargs = {'n_components': 1}
-    seg_method_attempts = ['p2p_true', 'p2p_pred']
+    seg_method_attempts = os.environ.get('SEG_METHODS', 'p2p_true p2p_pred').split()
     p_score_attempts = [-1] # [-1, 0.7, 0.75, 0.8, 0.85]
     delta_attempts = np.arange(0, 1+.001, 0.1)
     for seg_method, p_score, delta in itertools.product(seg_method_attempts, p_score_attempts, delta_attempts):
@@ -201,49 +201,12 @@ def main():
         # print(sorted_dataframe.iloc[:5], flush=True)
         del sorted_dataframe
         
-        # Save
-        key = (args.ahrs_filter_type, seg_method)
-        if key not in feature_dict:
-            feature_dict[key] = {
-                'features': features,
-                'feature_names': feature_names,
-                'subjects': subjects,
-                'features_1st': features_1st,
-                'feature_names_1st': feature_names_1st,
-                'features_2nd': features_2nd,
-                'feature_names_2nd': feature_names_2nd,
-                'dataframe': dataframe,
-                'best_delta': delta,
-                'elements': elements,
-                'precision_score': p_score
-            }
-        else:
-            # compare the current best feature with the saved best feature
-            curr_df = dataframe.sort_values(by=['corr'], key=lambda x:np.abs(x), ascending=False)
-            curr_df = curr_df[curr_df['icc'] >= ICC_THRESH]
-            curr_corr = curr_df['corr'].iloc[0] if len(curr_df) else 0.0
-            print('curr_corr: {:.2f}'.format(curr_corr), flush=True)
-            
-            prev_df = feature_dict[key]['dataframe'].sort_values(by=['corr'], key=lambda x:np.abs(x), ascending=False)
-            prev_df = prev_df[prev_df['icc'] >= ICC_THRESH]
-            prev_corr = prev_df['corr'].iloc[0] if len(prev_df) else 0.0
-            print('prev_corr: {:.2f}'.format(prev_corr), flush=True)
-            
-            if np.abs(curr_corr) > np.abs(prev_corr):
-                feature_dict[key] = {
-                    'features': features,
-                    'feature_names': feature_names,
-                    'subjects': subjects,
-                    'features_1st': features_1st,
-                    'feature_names_1st': feature_names_1st,
-                    'features_2nd': features_2nd,
-                    'feature_names_2nd': feature_names_2nd,
-                    'dataframe': dataframe,
-                    'best_delta': delta,
-                    'elements': elements,
-                    'precision_score': p_score
-                }
-            del curr_df, curr_corr, prev_df, prev_corr
+        # Save every delta (the delta is selected inside the LOSO by motor_assessment.py)
+        feature_dict[(args.ahrs_filter_type, seg_method, float(delta))] = {
+            'features': features, 'feature_names': feature_names, 'subjects': subjects,
+            'features_1st': features_1st, 'feature_names_1st': feature_names_1st,
+            'features_2nd': features_2nd, 'feature_names_2nd': feature_names_2nd,
+            'dataframe': dataframe, 'delta': delta}
 
         # del stroke_data_copy
         del results
@@ -261,7 +224,7 @@ def main():
     os.makedirs(output_folder, exist_ok=True)
     output_name = os.path.join(
         output_folder,
-        'feature_dict_{:s}_{:s}_ICC_{:s}_{:.2f}_{:s}_split_method_1_1.5.npz'.format(
+        'feature_dict_alldelta_{:s}_{:s}_ICC_{:s}_{:.2f}_{:s}_split_method_1_1.5.npz'.format(
             args.timestamp,
             args.ahrs_filter_type,
             args.icc_type,

@@ -1,3 +1,26 @@
+"""Train / evaluate one P2P detector (one LOSO fold), logging every epoch to Weights & Biases.
+
+Data (see README): --data_dir holds the real windows, data_real_th0.4_singleP2P_man/S{n}/ (healthy, subjects 1-20 except 7)
+and data_stroke_th0.4_singleP2P_man/S{n}/ (stroke); --synth_dir holds Phase II output, S{n}_3s50Hz/.
+Splits: --{real,synth,stroke}_splits = number of subjects for train / val / test, drawn with
+np.random.default_rng(random_seed); the seed therefore fixes the LOSO fold (test subject).
+Model: ResNet-34, accelerometer only, 30 epochs, Adam lr 1e-4, inverse-frequency weighted BCE. Fine-tuning
+(--pretr_model or --pretr_path) uses layer-wise learning rates lr/6 ... lr. Reported metric: calibrated test AUPRC
+(test_auprc_unb) at the epoch with the best val_auprc_unb (analysis/build_per_fold.py).
+
+Runs of the paper (seed = fold; healthy seeds 0 1 2 3 4 5 6 7 8 10 13 18 22 26 28 35 44 62,
+stroke seeds 22 2 8 18 26 3 1 6 5 13 62 7 35 10 4 0 28):
+  Fig. 3, synthetic from N subjects:  --synth_splits N 0 0 --real_splits 0 3 1 --synth_dir synthetic_dataset/local_H0p35
+                                      (N = 1 also: --save_name synth1_seed<seed>, the Fig. 4 / Fig. 5 / StrokeRehab pretraining)
+  Fig. 3, real from N subjects:       --real_splits N 3 1            (+ --aug um2017 for the augmentation baseline)
+  Fig. 4, pretrained, n stroke:       --stroke_splits n 3 1 --pretr_path models/synth1_seed<seed>.pth
+                                      (real-healthy pretraining: --pretr_path models/train_10real_seed<seed>.pth, saved by a
+                                       Fig. 3 real run with --real_splits 10 3 1 --save_name train_10real_seed<seed>)
+  Fig. 4, from scratch:               --stroke_splits n 3 1          (+ --aug um2017)
+  Fig. 5 detectors:                   see digital_biomarker/README section in the top-level README
+  Ablations:                          Fig. 3/4 commands with --synth_dir pointing to the ablation's Phase II output
+  Dataset size:                       --synth_size 0.2 / 0.4 / 0.6 / 0.8 (fraction of 20,000 windows)
+"""
 import os
 import glob
 import argparse
@@ -20,7 +43,7 @@ torch.backends.cudnn.enabled = False
 
 from utils_architectures import *
 from utils_data import *
-import biobank_model_setup as bbms
+from utils_augment import AugmentedDataset, UM2017
 
 
 def run_epoch(model, dataloader, criterion, optimizer=None, split='train', threshold=0.5):
@@ -92,11 +115,7 @@ def run_epoch(model, dataloader, criterion, optimizer=None, split='train', thres
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def main():
-    tags = ['19subjects', 'synthmocap', 'synth_allP2P', 'singleP2P', 'auto_man_labels'] # 'lenMoCap_thr', 'no_nans_mocap', 'smooth2', 'sweep_real_size', 'sweep_synth_size', 'weighted_loss', 'f1loss'
-    tags += ['resnet' + str(sweep_configuration['parameters']['resnet_type']['value'])]
-    # if sweep_configuration['parameters']['stroke_size']['value'] > 0: tags += ['real_stroke']
-    if sweep_configuration['parameters']['validate_thr']['value'] == 'bestth': tags += ['valF1']
-    if sweep_configuration['parameters']['validate_thr']['value'] == 'bestth_unb': tags += ['valF1unb']
+    tags = ['resnet' + str(sweep_configuration['parameters']['resnet_type']['value'])] + list(args.tag)
     run = wandb.init(config=sweep_configuration, group='train-real_val_test_real-LOSO_fold-resnet18', tags=tags)
     
     # Define hyperparameters and other settings
@@ -106,8 +125,6 @@ def main():
     seed = wandb.config.random_seed
     dropout_prob = wandb.config.dropout_prob
     synth_size = wandb.config.synth_size
-    # real_size = wandb.config.real_size
-    # stroke_size = wandb.config.stroke_size
     synth_splits = wandb.config.synth_splits
     real_splits = wandb.config.real_splits
     stroke_splits = wandb.config.stroke_splits
@@ -117,13 +134,9 @@ def main():
     with_gyro = bool(wandb.config.with_gyro)
     with_acc = bool(wandb.config.with_acc)
     validate_thr = wandb.config.validate_thr
-    compressed = wandb.config.compressed
     resnet_type = wandb.config.resnet_type
     pretrained = wandb.config.pretrained
-    posttrained = wandb.config.posttrained
     pretrained_model = wandb.config.pretrained_model
-    pretrained_biobank = wandb.config.pretrained_biobank
-    finetune_val = wandb.config.finetune_val
     save_model = bool(wandb.config.save_model)
     
     dataset = {}
@@ -154,6 +167,8 @@ def main():
         perm = rng_stroke.permutation([1,2,3,4,5,7,9,10,11,12,13,14,16,17,18,19,20])
         splits = [np.split(perm, [stroke_splits[0], 17-sum(stroke_splits[1:]),
                                   17-stroke_splits[2]])[s] for s in [0,2,3]]
+        if wandb.config.get('stroke_split_legacy', 0):  # Fig. 5 detectors: contiguous [train|val|test] split of the permutation
+            splits = np.split(perm, np.cumsum(stroke_splits))[:3]
         print(f'Subject splits (stroke): {splits}')
         
         dataset['stroke'] = {}
@@ -179,9 +194,8 @@ def main():
         for name, split in zip(['tr','va','te'], splits):
             file_names = sum([
                 list(rng_synth.choice(np.array(sorted(
-                    glob.glob('/work/pi_sunghoonlee_umass_edu/Ignacio/P2P-classifier/synthetic_dataset'
-                              + f'/S{s}_3s50Hz/*_*_*.npy'),
-                    key=lambda x: int(os.path.basename(x).split('_')[1])
+                    glob.glob(wandb.config.synth_dir + f'/S{s}_3s50Hz/*_*_*.npy'),
+                    key=lambda x: (int(os.path.basename(x).split('_')[1]), os.path.basename(x))
                 )).reshape(-1,4), int(synth_size * 2e4 / len(split)), False).reshape(-1)) for s in split], []) # 1->len(split)
             dataset['synth'][name] = CustomDataset(file_names, is_synth=True, augment=with_aug,
                                                    with_gyro=with_gyro, with_acc=with_acc)
@@ -195,33 +209,30 @@ def main():
     positive_rate = np.mean([s['label'] for s in train_dataset])
     WEIGHTS = [1 / (1 - positive_rate), 1 / positive_rate]
     
+    # On-the-fly augmentation of TRAINING windows only (val/test untouched)
+    if wandb.config.aug == 'um2017':
+        train_dataset = AugmentedDataset(train_dataset, cfg=UM2017, seed=seed)
+        print(f'Augmentation: Um et al. 2017 {UM2017}')
+    
     # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
-    if posttrained:
-        test_trft_loader = DataLoader(test_trft_dataset, batch_size=batch_size, shuffle=True)
-        test_teft_loader = DataLoader(test_teft_dataset, batch_size=batch_size)
 
-    # model = CNNClassifier(compressed, dropout_prob).to(device)
     if resnet_type == 18: layers = [2, 2, 2, 2]; block = BasicBlock
     elif resnet_type == 34: layers = [3, 4, 6, 3]; block = BasicBlock
     elif resnet_type == 50: layers = [3, 4, 6, 3]; block = Bottleneck
     else: raise NotImplementedError
-    ########################################################################################
     model = ResNet(block, layers, dropout_prob, with_gyro=with_gyro, with_acc=with_acc).to(device)
-    # model = bbms.setup_model(bbms.config, device)
-    # model = BioBank(model, outputs=1).to(device)
-    ########################################################################################
     
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    if posttrained: optimizer_ft = optim.Adam(model.fc.parameters(), lr=learning_rate/10)
-    if finetune_val: optimizer_ft = optim.Adam(model.fc.parameters(), lr=learning_rate/10)
     if pretrained:
         pm_seed, pm_split, pm_issynth = tuple(pretrained_model)
         pm_dom = 'synth' if pm_issynth else 'real'
-        model.load_state_dict(torch.load(f'{root_dir}/models/train_{pm_split}{pm_dom}_seed{pm_seed}.pth'))
+        pm_path = wandb.config.pretr_path or f'{model_dir}/train_{pm_split}{pm_dom}_seed{pm_seed}.pth'
+        print(f'Loading pretrained model: {pm_path}')
+        model.load_state_dict(torch.load(pm_path))
         optimizer = optim.Adam([
             {'params': model.conv1.parameters(), 'lr': learning_rate/6},
             {'params': model.layer1.parameters(), 'lr': learning_rate/5},
@@ -229,18 +240,6 @@ def main():
             {'params': model.layer3.parameters(), 'lr': learning_rate/3},
             {'params': model.layer4.parameters(), 'lr': learning_rate/2},
             {'params': model.fc.parameters(), 'lr': learning_rate}
-        ])
-        
-    elif pretrained_biobank:
-        bbms.config['load_weights'] = True
-        model = bbms.setup_model(bbms.config, device)
-        optimizer = optim.Adam([
-            {'params': model.feature_extractor.layer1.parameters(), 'lr': learning_rate/6},
-            {'params': model.feature_extractor.layer2.parameters(), 'lr': learning_rate/5},
-            {'params': model.feature_extractor.layer3.parameters(), 'lr': learning_rate/4},
-            {'params': model.feature_extractor.layer4.parameters(), 'lr': learning_rate/3},
-            {'params': model.feature_extractor.layer5.parameters(), 'lr': learning_rate/2},
-            {'params': model.classifier.parameters(), 'lr': learning_rate}
         ])
 
     best_metric = 0
@@ -268,12 +267,11 @@ def main():
         wandb.log(dict([(f'{split}_{k}', all_metrics[split][k]) for k in metrics_names
                         for split in all_metrics.keys()]))
         
-        ########################################################################################
-        if val_metrics['auprc_unb'] > best_metric:
+        if val_metrics['auprc_unb'] > best_metric:   # keep the best-validation weights (used for pretraining)
             best_metric = val_metrics['auprc_unb']
-            if save_model: torch.save(model.state_dict(),
-                                      f'{root_dir}/models/train_{synth_splits[0]}synth_seed{seed}.pth')
-        ########################################################################################
+            if save_model:
+                os.makedirs(model_dir, exist_ok=True)
+                torch.save(model.state_dict(), f'{model_dir}/{wandb.config.save_name}.pth')
         
         print(f'################ Epoch {epoch:02d} ################')
         print(train_metrics['f1'], train_metrics['f1_unb'])
@@ -285,17 +283,25 @@ def main():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--random_seed', type=int, default=1, help='Random seed')
-    parser.add_argument('--synth_size', type=float, default=1.0, help='Synthetic size')
-    # parser.add_argument('--real_size', type=float, default=0.3, help='Real size')
-    # parser.add_argument('--stroke_size', type=float, default=0.0, help='Stroke size')
+    parser.add_argument('--synth_size', type=float, default=1.0, help='Synthetic data size, fraction of 20,000 windows')
     parser.add_argument('--synth_splits', nargs='+', type=int, default=[0,0,0], help='Synth splits train/val/test')
     parser.add_argument('--real_splits', nargs='+', type=int, default=[0,0,0], help='Real splits train/val/test')
     parser.add_argument('--stroke_splits', nargs='+', type=int, default=[0,0,0], help='Stroke splits train/val/test')
     parser.add_argument('--pretr_model', nargs=3, type=int, default=[0,0,0],
                         help='Pretrained model seed/num_subj/is_synth')
+    parser.add_argument('--aug', choices=['none', 'um2017'], default='none', help='Training-set augmentation (Um et al. 2017)')
+    parser.add_argument('--pretr_path', type=str, default='', help='Pretrained weights (overrides --pretr_model naming)')
+    parser.add_argument('--save_name', type=str, default='', help='If set, save the best-val model to <model_dir>/<save_name>.pth')
+    parser.add_argument('--tag', nargs='*', default=[], help='WandB tags (used by analysis/build_per_fold.py to select runs)')
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--stroke_split_legacy', action='store_true', help='Fig. 5 detectors: contiguous [train|val|test] stroke split')
+    parser.add_argument('--data_dir', type=str, default=os.environ.get('P2P_DATA', 'data'), help='Real windows root')
+    parser.add_argument('--synth_dir', type=str, default=os.environ.get('P2P_SYNTH', 'synthetic_dataset/local_H0p35'), help='Phase II output root')
+    parser.add_argument('--model_dir', type=str, default=os.environ.get('P2P_MODELS', 'models'), help='Saved / pretrained models')
+    parser.add_argument('--wandb_project', type=str, default='P2P-classifier')
     args = parser.parse_args()
-    
-    root_dir = '/home/igavier_umass_edu/Documents/P2P-classifier'
+
+    root_dir, model_dir = args.data_dir, args.model_dir
 
     # Define sweep config
     sweep_configuration = {
@@ -303,14 +309,12 @@ if __name__ == '__main__':
         'name': 'train_real',
         'metric': {'goal': 'maximize', 'name': 'val_f1'},
         'parameters': {
-            'batch_size': {'values': [64]},
+            'batch_size': {'values': [args.batch_size]},
             'epochs': {'values': [30]},
             'lr': {'values': [1e-4]},
             'random_seed': {'value': args.random_seed},
             'dropout_prob': {'value': 0.2},
             'synth_size': {'value': args.synth_size},
-            # 'real_size': {'value': args.real_size},
-            # 'stroke_size': {'value': args.stroke_size},
             'synth_splits': {'value': args.synth_splits},
             'real_splits': {'value': args.real_splits},
             'stroke_splits': {'value': args.stroke_splits},
@@ -322,21 +326,20 @@ if __name__ == '__main__':
             'with_gyro': {'value': 0},
             'with_acc': {'value': 1},
             'validate_thr': {'value': 'bestth'},
-            'compressed': {'value': 0},
             'resnet_type': {'value': 34},
-            'pretrained': {'value': 1},
+            'pretrained': {'value': int(sum(args.pretr_model) > 0 or bool(args.pretr_path))},
             'pretrained_model': {'value': args.pretr_model},
-            'pretrained_biobank': {'value': 0},
-            'posttrained': {'value': 0},
-            'finetune_val': {'value': 0},
-            'save_model': {'value': 0}
+            'save_model': {'value': int(bool(args.save_name))},
+            'aug': {'value': args.aug},
+            'pretr_path': {'value': args.pretr_path},
+            'save_name': {'value': args.save_name},
+            'stroke_split_legacy': {'value': int(args.stroke_split_legacy)},
+            'synth_dir': {'value': args.synth_dir},
         },
     }
 
     # Initialize sweep by passing in config.
-    sweep_id = wandb.sweep(sweep=sweep_configuration, project='P2P-classifier')
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project=args.wandb_project)
     
     # Start sweep job.
     wandb.agent(sweep_id, function=main, count=1)
-    
-    # main()
